@@ -1,6 +1,7 @@
 """
 Proyecto: Alquiler de Patinetas y Ciclas Eléctricas
 Capa 4: endpoints HTTP (API REST con respuestas 100% JSON).
+Las zonas se manejan por NOMBRE; los puntos se buscan por nombre, dirección, zona o coordenadas.
 Ejecutar:  python app.py
 """
 import os
@@ -31,15 +32,24 @@ def manejar(funcion, mensaje_ok, codigo_ok=200):
         return respuesta(False, f"Error inesperado: {e}", None, 500)
 
 
+# ----------------------------- Zonas -----------------------------
 @app.get("/zonas")
 def get_zonas():
-    return manejar(f.listar_zonas, "Zonas consultadas correctamente.")
+    filtros = {"nombre": request.args.get("nombre")}
+    return manejar(lambda: f.listar_zonas(filtros), "Zonas consultadas correctamente.")
 
 
+@app.post("/zonas")
+def post_zona():
+    cuerpo = request.get_json(silent=True)
+    return manejar(lambda: f.crear_zona(cuerpo), "Zona creada correctamente.", 201)
+
+
+# ----------------------------- Puntos ----------------------------
 @app.get("/puntos")
 def get_puntos():
-    return manejar(lambda: f.listar_puntos(request.args.get("id_zona")),
-                   "Puntos de acopio consultados correctamente.")
+    filtros = {k: request.args.get(k) for k in ("nombre", "direccion", "zona", "latitud", "longitud")}
+    return manejar(lambda: f.listar_puntos(filtros), "Puntos de acopio consultados correctamente.")
 
 
 @app.get("/puntos/<id_punto>")

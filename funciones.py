@@ -1,8 +1,11 @@
 """
 Proyecto: Alquiler de Patinetas y Ciclas Eléctricas
 Capa 3: lógica del negocio del PAT-0003 (CRUD Puntos de Acopio con FK a Zonas).
-Contiene validaciones, sanitización y las operaciones sobre la base de datos.
+
+La zona SIEMPRE se indica por su nombre ('nombre_zona'); nunca por id.
+Los puntos se buscan por nombre, dirección, zona, latitud o longitud.
 """
+import os
 import re
 from conexion_bd import ejecutar_consulta
 
@@ -18,7 +21,19 @@ class NoEncontradoError(Exception):
 REGEX_DECIMAL = re.compile(r"^-?\d+(\.\d+)?$")
 REGEX_ENTERO = re.compile(r"^\d+$")
 
-CAMPOS_EDITABLES = ["id_zona", "nombre", "direccion", "latitud", "longitud", "capacidad_maxima"]
+# Si la zona no existe, se crea automáticamente (se puede desactivar con
+# CREAR_ZONA_AUTOMATICA=false en el archivo .env)
+CREAR_ZONA_AUTOMATICA = os.getenv("CREAR_ZONA_AUTOMATICA", "true").strip().lower() != "false"
+RADIO_ZONA_POR_DEFECTO_M = 1000
+
+# Campos propios del punto (la zona se indica aparte con 'nombre_zona')
+CAMPOS_PUNTO = ["nombre", "direccion", "latitud", "longitud", "capacidad_maxima"]
+
+SELECT_PUNTO = (
+    "SELECT p.id_punto, p.nombre, p.direccion, p.latitud, p.longitud, "
+    "p.capacidad_maxima, p.fecha_creacion, z.nombre AS nombre_zona "
+    "FROM puntos_acopio p JOIN zonas z ON z.id_zona = p.id_zona"
+)
 
 
 # ----------------------------------------------------------------------
@@ -85,19 +100,9 @@ def validar_capacidad(valor):
     return cap
 
 
-def validar_zona_existente(valor):
-    """Valida que id_zona sea entero y que exista en la tabla zonas (FK)."""
-    id_zona = convertir_int(valor, "id_zona")
-    zona = ejecutar_consulta("SELECT id_zona FROM zonas WHERE id_zona = %s", (id_zona,), "one")
-    if not zona:
-        raise ValidacionError(f"La zona con id {id_zona} no existe. Debe asignar una zona existente.")
-    return id_zona
-
-
 def validar_campo(campo, valor):
-    """Despacha la validación correspondiente a cada campo."""
+    """Despacha la validación correspondiente a cada campo del punto."""
     validadores = {
-        "id_zona": validar_zona_existente,
         "nombre": lambda v: validar_texto(v, "nombre", 100),
         "direccion": lambda v: validar_texto(v, "direccion", 200),
         "latitud": validar_latitud,
@@ -107,45 +112,131 @@ def validar_campo(campo, valor):
     return validadores[campo](valor)
 
 
-def validar_punto_completo(datos):
-    """Valida un punto de acopio con todos sus campos (POST / PUT)."""
-    if not isinstance(datos, dict):
-        raise ValidacionError("El cuerpo de la petición debe ser un objeto JSON.")
-    faltantes = [c for c in CAMPOS_EDITABLES if c not in datos]
-    if faltantes:
-        raise ValidacionError(f"Faltan campos obligatorios: {', '.join(faltantes)}")
-    return {campo: validar_campo(campo, datos[campo]) for campo in CAMPOS_EDITABLES}
+def rechazar_id_zona(datos):
+    """La zona se identifica por nombre; si llega un id se rechaza con un mensaje claro."""
+    if "id_zona" in datos:
+        raise ValidacionError("La zona se indica con 'nombre_zona', no con un id.")
 
 
 # ----------------------------------------------------------------------
-# Operaciones CRUD
+# Zonas (siempre por nombre)
 # ----------------------------------------------------------------------
-def listar_zonas():
-    """Retorna todas las zonas disponibles."""
-    return ejecutar_consulta("SELECT * FROM zonas ORDER BY id_zona", tipo="all")
+def buscar_zona_por_nombre(nombre, latitud=None, longitud=None):
+    """
+    Busca una zona por su nombre (sin distinguir mayúsculas) y retorna su id INTERNO.
+    Si la zona no existe y CREAR_ZONA_AUTOMATICA está activo, la crea usando las
+    coordenadas del punto como centro y un radio de cobertura por defecto.
+    """
+    nombre = validar_texto(nombre, "nombre_zona", 100)
+    zona = ejecutar_consulta(
+        "SELECT id_zona FROM zonas WHERE LOWER(nombre) = LOWER(%s)", (nombre,), "one")
+    if zona:
+        return zona["id_zona"]
+
+    if CREAR_ZONA_AUTOMATICA and latitud is not None and longitud is not None:
+        return ejecutar_consulta(
+            "INSERT INTO zonas (nombre, latitud, longitud, radio_cobertura_m) VALUES (%s, %s, %s, %s)",
+            (nombre, latitud, longitud, RADIO_ZONA_POR_DEFECTO_M), "insert")
+
+    filas = ejecutar_consulta("SELECT nombre FROM zonas ORDER BY nombre", tipo="all")
+    disponibles = ", ".join(z["nombre"] for z in filas) or "ninguna"
+    raise ValidacionError(
+        f"No existe una zona llamada '{nombre}'. Zonas disponibles: {disponibles}.")
 
 
-def listar_puntos(id_zona=None):
-    """Lista los puntos de acopio, opcionalmente filtrados por zona."""
-    sql = ("SELECT p.*, z.nombre AS nombre_zona FROM puntos_acopio p "
-           "JOIN zonas z ON z.id_zona = p.id_zona")
+def listar_zonas(filtros=None):
+    """Lista las zonas; filtro opcional por nombre. No expone ids."""
+    filtros = filtros or {}
+    sql = "SELECT nombre, latitud, longitud, radio_cobertura_m FROM zonas"
     parametros = ()
-    if id_zona is not None:
-        sql += " WHERE p.id_zona = %s"
-        parametros = (convertir_int(id_zona, "id_zona"),)
-    sql += " ORDER BY p.id_punto"
+    if filtros.get("nombre"):
+        sql += " WHERE nombre LIKE %s"
+        parametros = (f"%{validar_texto(filtros['nombre'], 'nombre', 100)}%",)
+    sql += " ORDER BY nombre"
     return _serializar(ejecutar_consulta(sql, parametros, "all"))
 
 
+def crear_zona(datos):
+    """Crea una zona validando nombre, coordenadas y radio de cobertura (POST /zonas)."""
+    if not isinstance(datos, dict):
+        raise ValidacionError("El cuerpo de la petición debe ser un objeto JSON.")
+    faltantes = [c for c in ("nombre", "latitud", "longitud", "radio_cobertura_m") if c not in datos]
+    if faltantes:
+        raise ValidacionError(f"Faltan campos obligatorios: {', '.join(faltantes)}")
+
+    nombre = validar_texto(datos["nombre"], "nombre", 100)
+    latitud = validar_latitud(datos["latitud"])
+    longitud = validar_longitud(datos["longitud"])
+    radio = convertir_float(datos["radio_cobertura_m"], "radio_cobertura_m")
+    if radio <= 0:
+        raise ValidacionError("El radio_cobertura_m debe ser mayor que 0.")
+
+    existe = ejecutar_consulta(
+        "SELECT 1 AS x FROM zonas WHERE LOWER(nombre) = LOWER(%s)", (nombre,), "one")
+    if existe:
+        raise ValidacionError(f"Ya existe una zona llamada '{nombre}'.")
+
+    ejecutar_consulta(
+        "INSERT INTO zonas (nombre, latitud, longitud, radio_cobertura_m) VALUES (%s, %s, %s, %s)",
+        (nombre, latitud, longitud, radio), "insert")
+    return listar_zonas({"nombre": nombre})
+
+
+# ----------------------------------------------------------------------
+# Puntos de acopio
+# ----------------------------------------------------------------------
+def validar_punto_completo(datos):
+    """Valida un punto con todos sus campos; la zona va como 'nombre_zona' (POST / PUT)."""
+    if not isinstance(datos, dict):
+        raise ValidacionError("El cuerpo de la petición debe ser un objeto JSON.")
+    rechazar_id_zona(datos)
+    faltantes = [c for c in ["nombre_zona"] + CAMPOS_PUNTO if c not in datos]
+    if faltantes:
+        raise ValidacionError(f"Faltan campos obligatorios: {', '.join(faltantes)}")
+
+    validado = {c: validar_campo(c, datos[c]) for c in CAMPOS_PUNTO}
+    validado["id_zona"] = buscar_zona_por_nombre(
+        datos["nombre_zona"], validado["latitud"], validado["longitud"])  # id interno
+    return validado
+
+
+def listar_puntos(filtros=None):
+    """
+    Lista los puntos de acopio. Filtros opcionales (se combinan con AND):
+    nombre, direccion, zona (nombre de la zona), latitud, longitud.
+    """
+    filtros = filtros or {}
+    sql = SELECT_PUNTO
+    condiciones, parametros = [], []
+
+    if filtros.get("nombre"):
+        condiciones.append("p.nombre LIKE %s")
+        parametros.append(f"%{validar_texto(filtros['nombre'], 'nombre', 100)}%")
+    if filtros.get("direccion"):
+        condiciones.append("p.direccion LIKE %s")
+        parametros.append(f"%{validar_texto(filtros['direccion'], 'direccion', 200)}%")
+    if filtros.get("zona"):
+        condiciones.append("z.nombre LIKE %s")
+        parametros.append(f"%{validar_texto(filtros['zona'], 'zona', 100)}%")
+    if filtros.get("latitud"):
+        condiciones.append("ABS(p.latitud - %s) < 0.00001")
+        parametros.append(validar_latitud(filtros["latitud"]))
+    if filtros.get("longitud"):
+        condiciones.append("ABS(p.longitud - %s) < 0.00001")
+        parametros.append(validar_longitud(filtros["longitud"]))
+
+    if condiciones:
+        sql += " WHERE " + " AND ".join(condiciones)
+    sql += " ORDER BY z.nombre, p.nombre"
+    return _serializar(ejecutar_consulta(sql, tuple(parametros), "all"))
+
+
 def obtener_punto(id_punto):
-    """Retorna un punto por su id o lanza NoEncontradoError."""
+    """Retorna un punto por su id interno o lanza NoEncontradoError."""
     id_punto = convertir_int(id_punto, "id_punto")
-    fila = ejecutar_consulta(
-        "SELECT p.*, z.nombre AS nombre_zona FROM puntos_acopio p "
-        "JOIN zonas z ON z.id_zona = p.id_zona WHERE p.id_punto = %s",
-        (id_punto,), "one")
+    fila = ejecutar_consulta(SELECT_PUNTO + " WHERE p.id_punto = %s", (id_punto,), "one")
     if not fila:
-        raise NoEncontradoError(f"No existe el punto de acopio con id {id_punto}.")
+        raise NoEncontradoError("No existe el punto de acopio solicitado.")
     return _serializar([fila])[0]
 
 
@@ -173,15 +264,23 @@ def reemplazar_punto(id_punto, datos):
 
 
 def actualizar_parcial_punto(id_punto, datos):
-    """Actualiza solo los campos enviados (PATCH)."""
-    obtener_punto(id_punto)
+    """Actualiza solo los campos enviados (PATCH). La zona, si se cambia, va por nombre."""
+    punto_actual = obtener_punto(id_punto)
     if not isinstance(datos, dict) or not datos:
         raise ValidacionError("Debe enviar al menos un campo para actualizar.")
-    invalidos = [c for c in datos if c not in CAMPOS_EDITABLES]
+    rechazar_id_zona(datos)
+    permitidos = CAMPOS_PUNTO + ["nombre_zona"]
+    invalidos = [c for c in datos if c not in permitidos]
     if invalidos:
         raise ValidacionError(f"Campos no permitidos: {', '.join(invalidos)}")
 
-    campos = {c: validar_campo(c, v) for c, v in datos.items()}
+    campos = {c: validar_campo(c, v) for c, v in datos.items() if c != "nombre_zona"}
+    if "nombre_zona" in datos:
+        campos["id_zona"] = buscar_zona_por_nombre(
+            datos["nombre_zona"],
+            campos.get("latitud", punto_actual["latitud"]),
+            campos.get("longitud", punto_actual["longitud"]))  # id interno
+
     asignaciones = ", ".join(f"{c}=%s" for c in campos)
     ejecutar_consulta(
         f"UPDATE puntos_acopio SET {asignaciones} WHERE id_punto=%s",
@@ -190,7 +289,7 @@ def actualizar_parcial_punto(id_punto, datos):
 
 
 def eliminar_punto(id_punto):
-    """Elimina un punto de acopio (DELETE)."""
+    """Elimina un punto de acopio (DELETE) y retorna el punto eliminado."""
     punto = obtener_punto(id_punto)
     ejecutar_consulta("DELETE FROM puntos_acopio WHERE id_punto = %s", (int(id_punto),))
     return punto
